@@ -11,7 +11,7 @@ object MockSMTP {
   case object Ready
 }
 
-class MockSMTP(parent: ActorRef, port: Int) extends Actor with ActorLogging {
+class MockSMTP(parent: ActorRef, port: Int, initialGreeting: Option[String] = None) extends Actor with ActorLogging {
 
   import context.system
   import MockSMTP._
@@ -26,7 +26,7 @@ class MockSMTP(parent: ActorRef, port: Int) extends Actor with ActorLogging {
 
     case Tcp.Connected(remote, local) =>
       log.info(s"Received connection")
-      sender() ! Tcp.Register(context.actorOf(Props(classOf[Handler], sender()), "handler"))
+      sender() ! Tcp.Register(context.actorOf(Props(classOf[Handler], sender(), initialGreeting), "handler"))
   }
 
 

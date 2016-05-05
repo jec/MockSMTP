@@ -3,8 +3,15 @@ package net.jcain.net
 import akka.actor.{Actor, ActorLogging, ActorRef, FSM}
 import akka.io.Tcp
 import akka.util.ByteString
+import scala.collection.immutable.Queue
 
 object Handler {
+
+  val InitialGreeting = ByteString("220 localhost ESMTP net.jcain.net.MockSMTP\r\n")
+  val CommandNotRecognized = ByteString("500 Error: command not recognized\r\n")
+  val OK = ByteString("250 Ok\r\n")
+  val EndWithCrLf = ByteString("354 End data with <CR><LF>.<CR><LF>\r\n")
+  val Bye = ByteString("221 Bye\r\n")
 
   // SMTP commands
   sealed trait Command
@@ -12,9 +19,9 @@ object Handler {
   final case class C_HELO(host: String) extends Command
   object C_EHLO { val Pattern = """(EHLO|ehlo) +(.*)""".r }
   final case class C_EHLO(host: String) extends Command
-  object C_MAIL { val Pattern = """(MAIL FROM|mail from):(.*)""".r }
+  object C_MAIL { val Pattern = """(MAIL FROM|mail from):<(.*)>""".r }
   final case class C_MAIL(from: String) extends Command
-  object C_RCPT { val Pattern = """(RCPT TO|rcpt to):(.*)""".r }
+  object C_RCPT { val Pattern = """(RCPT TO|rcpt to):<(.*)>""".r }
   final case class C_RCPT(to: String) extends Command
   case object C_DATA extends Command
   case object C_RSET extends Command
@@ -36,8 +43,7 @@ object Handler {
   // states
   sealed trait State
   case object Greeting extends State
-  case object Helo extends State
-  case object StartMessage extends State
+  case object Idle extends State
   case object MailFrom extends State
   case object RcptTo extends State
   case object Data extends State
@@ -50,17 +56,18 @@ object Handler {
   // data
   sealed trait StateData
   case object Uninitialized extends StateData
-  final case class LastResponse(code: Int, level: Int, response: String, message: Option[String]) extends StateData
+  final case class HeloData(remoteHost: String) extends StateData
+  final case class Pending(remoteHost: String, from: String, rcpts: Queue[String] = Queue(), body: Queue[String] = Queue()) extends StateData
 
   // Protocol: messages received
   final case class ReceivedCommand(code: Int, level: Int, response: String)
 
 }
 
-class Handler(tcp: ActorRef) extends Actor with FSM[Handler.State, Handler.StateData] with ActorLogging {
+class Handler(tcp: ActorRef, initialGreeting: Option[String] = None)
+extends Actor with FSM[Handler.State, Handler.StateData] with ActorLogging {
 
   class BufferedTokenizer(delimiter: String = "\n") {
-
     import scala.collection.mutable.ListBuffer
 
     // Contains the data awaiting the next delimiter
@@ -78,12 +85,9 @@ class Handler(tcp: ActorRef) extends Actor with FSM[Handler.State, Handler.State
         entities.iterator
       }
     }
-
   }
 
   import Handler._
-
-  val InitialGreeting = ByteString("220 localhost ESMTP net.jcain.net.MockSMTP")
 
   // Collects the raw response data and extracts the lines
   val rawBuffer = new BufferedTokenizer("\r\n")
@@ -91,40 +95,103 @@ class Handler(tcp: ActorRef) extends Actor with FSM[Handler.State, Handler.State
   // Collects the processed response text line by line to accommodate continuation lines
   var responseBuffer: Vector[String] = Vector.empty
 
-  tcp ! Tcp.Write(InitialGreeting)
-
   startWith(Greeting, Uninitialized)
+
+  initialGreeting match {
+    case None =>
+      sendData(InitialGreeting)
+    case Some(greeting) =>
+      sendData(greeting)
+      tcp ! Tcp.Close
+      context.stop(self)
+  }
 
   when (Greeting) {
     case Event(C_HELO(remoteHost), Uninitialized) =>
-      goto(Helo)
+      sendData(s"250 Hello $remoteHost, nice to meet you")
+      goto(Idle) using HeloData(remoteHost)
+    case Event(C_EHLO(remoteHost), Uninitialized) =>
+      sendData("250 localhost") // TODO: add extensions?
+      goto(Idle) using HeloData(remoteHost)
     case Event(C_QUIT, Uninitialized) =>
       goto(Quit)
   }
 
-  when (Helo) {
-    case Event(C_HELO(remoteHost), Uninitialized) =>
-      goto(MailFrom)
+  when (Idle) {
+    case Event(C_MAIL(from), HeloData(remoteHost)) =>
+      sendData(OK)
+      goto(MailFrom) using Pending(remoteHost, from)
+  }
+
+  when (MailFrom) {
+    case Event(C_RCPT(to), Pending(remoteHost, from, rcpts, body)) =>
+      sendData(OK)
+      goto(RcptTo) using Pending(remoteHost, from, Queue(to), body)
+  }
+
+  when (RcptTo) {
+    case Event(C_RCPT(to), Pending(remoteHost, from, rcpts, body)) =>
+      sendData(OK)
+      stay() using Pending(remoteHost, from, rcpts.enqueue(to), body)
+    case Event(C_DATA, pending: Pending) =>
+      sendData(EndWithCrLf)
+      goto(Data)
+  }
+
+  when (Data) {
+    case Event(Tcp.Received(data), Pending(remoteHost, from, rcpts, body)) =>
+      // TODO: might be split among previous strings
+      if (data.endsWith(Seq(13, 10, 46, 13, 10))) {
+        // TODO: store the message
+        sendData("250 Ok: queued as 12345")
+        goto(Idle) using HeloData(remoteHost)
+      }
+      else
+        stay() using Pending(remoteHost, from, rcpts, body.enqueue(data.utf8String))
   }
 
   whenUnhandled {
     case Event(Tcp.Received(data), _) =>
       val str = data.utf8String
       for (line <- rawBuffer.extract(str)) {
-        self ! createCommand(line)
+        createCommand(line.stripLineEnd) match {
+          case Some(cmd) => self ! cmd
+          case None      => sendData(CommandNotRecognized)
+        }
       }
       stay()
 
-    case Event(_: Tcp.ConnectionClosed, data @ LastResponse(responseCode, level, response, messageOpt)) =>
-      log.info("Connection closed in state {}/{}", stateName, data)
-      goto(Done)
+    case Event(C_QUIT, _) =>
+      quit()
 
-    case Event(FSM.StateTimeout, _) =>
-      goto(Done)
+    case Event(C_RSET, HeloData(remoteHost)) =>
+      sendData(OK)
+      stay()
+
+    case Event(C_RSET, Pending(remoteHost, from, rcpts, body)) =>
+      sendData(OK)
+      goto(Idle) using HeloData(remoteHost)
+
+    case Event(_: Tcp.ConnectionClosed, data: StateData) =>
+      log.info("Connection closed in state {}/{}", stateName, data)
+      quit()
 
     case Event(e, s) =>
       log.warning("Received unhandled message {} in state {}/{}", e, stateName, s)
       stay()
   }
+
+  def quit() = {
+    sendData(Bye)
+    tcp ! Tcp.Close
+    context.stop(self)
+    stay()
+  }
+
+  def sendData(text: String) =
+    tcp ! Tcp.Write(ByteString(s"$text\r\n"))
+
+  def sendData(data: ByteString) =
+    tcp ! Tcp.Write(data)
 
 }
