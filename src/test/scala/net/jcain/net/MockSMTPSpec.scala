@@ -111,26 +111,44 @@ with ImplicitSender {
     }
 
     "MailFrom" when {
-      "RCPT TO" should {
-        "accept multiple recipients and go to RcptTo state and remain" in new HandlerFixture("mailfrom-rcptto") {
-          // EHLO
-          sendData("EHLO bedevere.tremtek.com")
-          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("250 localhost") }
-          stateProbe.expectMsg(Transition(handler, Greeting, Idle))
-          // MAIL FROM
-          sendData("MAIL FROM:<admin@tremtek.com>")
-          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("250 Ok") }
-          stateProbe.expectMsg(Transition(handler, Idle, MailFrom))
-          // RCPT TO
-          sendData("RCPT TO:<jcain@tremtek.com>")
-          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("250 Ok") }
-          stateProbe.expectMsg(Transition(handler, MailFrom, RcptTo))
-          sendData("RCPT TO:<chanselman@tremtek.com>")
-          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("250 Ok") }
-          stateProbe.expectNoMsg(2.seconds)
-          sendData("RCPT TO:<jec@tremtek.com>")
-          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("250 Ok") }
-          stateProbe.expectNoMsg(2.seconds)
+      "RCPT TO" when {
+        "recipient contains NORELAY" should {
+          "respond with 554 message" in new HandlerFixture("mailfrom-rcptto-norelay") {
+            // EHLO
+            sendData("EHLO bedevere.tremtek.com")
+            dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 localhost") }
+            stateProbe.expectMsg(Transition(handler, Greeting, Idle))
+            // MAIL FROM
+            sendData("MAIL FROM:<admin@tremtek.com>")
+            dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 Ok") }
+            stateProbe.expectMsg(Transition(handler, Idle, MailFrom))
+            // RCPT TO
+            sendData("RCPT TO:<jcain-NORELAY@tremtek.com>")
+            dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("554 Relay") }
+            stateProbe.expectNoMsg(1.second)
+          }
+        }
+        "recipient is normal" should {
+          "accept multiple recipients and go to RcptTo state and remain" in new HandlerFixture("mailfrom-rcptto-ok") {
+            // EHLO
+            sendData("EHLO bedevere.tremtek.com")
+            dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 localhost") }
+            stateProbe.expectMsg(Transition(handler, Greeting, Idle))
+            // MAIL FROM
+            sendData("MAIL FROM:<admin@tremtek.com>")
+            dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 Ok") }
+            stateProbe.expectMsg(Transition(handler, Idle, MailFrom))
+            // RCPT TO
+            sendData("RCPT TO:<jcain@tremtek.com>")
+            dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 Ok") }
+            stateProbe.expectMsg(Transition(handler, MailFrom, RcptTo))
+            sendData("RCPT TO:<chanselman@tremtek.com>")
+            dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 Ok") }
+            stateProbe.expectNoMsg(1.second)
+            sendData("RCPT TO:<jec@tremtek.com>")
+            dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 Ok") }
+            stateProbe.expectNoMsg(1.second)
+          }
         }
       }
     }

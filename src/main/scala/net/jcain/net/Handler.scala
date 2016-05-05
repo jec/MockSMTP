@@ -10,6 +10,7 @@ object Handler {
   val InitialGreeting = ByteString("220 localhost ESMTP net.jcain.net.MockSMTP\r\n")
   val CommandNotRecognized = ByteString("500 Error: command not recognized\r\n")
   val OK = ByteString("250 Ok\r\n")
+  val NoRelay = ByteString("554 Relay access denied\r\n")
   val EndWithCrLf = ByteString("354 End data with <CR><LF>.<CR><LF>\r\n")
   val Bye = ByteString("221 Bye\r\n")
 
@@ -125,14 +126,19 @@ extends Actor with FSM[Handler.State, Handler.StateData] with ActorLogging {
 
   when (MailFrom) {
     case Event(C_RCPT(to), Pending(remoteHost, from, rcpts, body)) =>
-      sendData(OK)
-      goto(RcptTo) using Pending(remoteHost, from, Queue(to), body)
+      if (validateRecipient(to))
+        goto(RcptTo) using Pending(remoteHost, from, Queue(to), body)
+      else
+        stay()
   }
 
   when (RcptTo) {
     case Event(C_RCPT(to), Pending(remoteHost, from, rcpts, body)) =>
-      sendData(OK)
-      stay() using Pending(remoteHost, from, rcpts.enqueue(to), body)
+      val newRcpts = if (validateRecipient(to))
+        rcpts.enqueue(to)
+      else
+        rcpts
+      stay() using Pending(remoteHost, from, newRcpts, body)
     case Event(C_DATA, pending: Pending) =>
       sendData(EndWithCrLf)
       goto(Data)
@@ -179,6 +185,16 @@ extends Actor with FSM[Handler.State, Handler.StateData] with ActorLogging {
     case Event(e, s) =>
       log.warning("Received unhandled message {} in state {}/{}", e, stateName, s)
       stay()
+  }
+
+  def validateRecipient(rcpt: String) = {
+    if (rcpt.contains("NORELAY")) {
+      sendData(NoRelay)
+      false
+    } else {
+      sendData(OK)
+      true
+    }
   }
 
   def quit() = {
