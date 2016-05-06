@@ -11,8 +11,14 @@ object Handler {
   val CommandNotRecognized = ByteString("500 Error: command not recognized\r\n")
   val OK = ByteString("250 Ok\r\n")
   val NoRelay = ByteString("554 Relay access denied\r\n")
+  val NotFound = ByteString("550 User not found\r\n")
   val EndWithCrLf = ByteString("354 End data with <CR><LF>.<CR><LF>\r\n")
   val Bye = ByteString("221 Bye\r\n")
+
+  object Patterns {
+    val NotFound = "NOTFOUND".r.unanchored
+    val NoRelay = "NORELAY".r.unanchored
+  }
 
   // SMTP commands
   sealed trait Command
@@ -58,7 +64,7 @@ object Handler {
   sealed trait StateData
   case object Uninitialized extends StateData
   final case class HeloData(remoteHost: String) extends StateData
-  final case class Pending(remoteHost: String, from: String, rcpts: Queue[String] = Queue(), body: Queue[String] = Queue()) extends StateData
+  final case class Pending(remoteHost: String, from: String, rcpts: Queue[String] = Queue(), body: StringBuilder = new StringBuilder) extends StateData
 
   // Protocol: messages received
   final case class ReceivedCommand(code: Int, level: Int, response: String)
@@ -146,14 +152,14 @@ extends Actor with FSM[Handler.State, Handler.StateData] with ActorLogging {
 
   when (Data) {
     case Event(Tcp.Received(data), Pending(remoteHost, from, rcpts, body)) =>
-      // TODO: might be split among previous strings
-      if (data.endsWith(Seq(13, 10, 46, 13, 10))) {
+      val newBody = body.append(data.utf8String)
+      if (newBody.endsWith(Seq(13, 10, 46, 13, 10))) {
         // TODO: store the message
         sendData("250 Ok: queued as 12345")
         goto(Idle) using HeloData(remoteHost)
       }
       else
-        stay() using Pending(remoteHost, from, rcpts, body.enqueue(data.utf8String))
+        stay() using Pending(remoteHost, from, rcpts, newBody)
   }
 
   whenUnhandled {
@@ -188,12 +194,16 @@ extends Actor with FSM[Handler.State, Handler.StateData] with ActorLogging {
   }
 
   def validateRecipient(rcpt: String) = {
-    if (rcpt.contains("NORELAY")) {
-      sendData(NoRelay)
-      false
-    } else {
-      sendData(OK)
-      true
+    rcpt match {
+      case Patterns.NoRelay(_*) =>
+        sendData(NoRelay)
+        false
+      case Patterns.NotFound(_*) =>
+        sendData(NotFound)
+        false
+      case _ =>
+        sendData(OK)
+        true
     }
   }
 

@@ -34,6 +34,8 @@ with ImplicitSender {
 
     def sendData(text: String) = handler ! Tcp.Received(ByteString(s"$text\r\n"))
 
+    def stop() = system.stop(handler)
+
   }
 
   "MockSMTP" when {
@@ -46,6 +48,7 @@ with ImplicitSender {
         // attempt to connect to the port
         IO(Tcp) ! Connect(new InetSocketAddress("localhost", Port))
         expectMsgPF() { case Tcp.Connected(_, _) => }
+        system.stop(server)
       }
     }
   }
@@ -75,6 +78,7 @@ with ImplicitSender {
       "configured to respond with a busy message" should {
         "respond with the message" in new HandlerFixture("greeting-busy", initialGreeting = Some("554 Service unavailable")) {
           dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String shouldBe initialGreeting.get + "\r\n" }
+          stop()
         }
       }
       "HELO" should {
@@ -83,6 +87,7 @@ with ImplicitSender {
           sendData("HELO bedevere.tremtek.com")
           dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("250 Hello") }
           stateProbe.expectMsg(Transition(handler, Greeting, Idle))
+          stop()
         }
       }
       "EHLO" should {
@@ -91,6 +96,7 @@ with ImplicitSender {
           sendData("EHLO bedevere.tremtek.com")
           dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("250 localhost") }
           stateProbe.expectMsg(Transition(handler, Greeting, Idle))
+          stop()
         }
       }
     }
@@ -106,6 +112,7 @@ with ImplicitSender {
           sendData("MAIL FROM:<admin@tremtek.com>")
           dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("250 Ok") }
           stateProbe.expectMsg(Transition(handler, Idle, MailFrom))
+          stop()
         }
       }
     }
@@ -126,6 +133,24 @@ with ImplicitSender {
             sendData("RCPT TO:<jcain-NORELAY@tremtek.com>")
             dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("554 Relay") }
             stateProbe.expectNoMsg(1.second)
+            stop()
+          }
+        }
+        "recipient contains NOTFOUND" should {
+          "respond with 550 message" in new HandlerFixture("mailfrom-rcptto-notfound") {
+            // EHLO
+            sendData("EHLO bedevere.tremtek.com")
+            dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 localhost") }
+            stateProbe.expectMsg(Transition(handler, Greeting, Idle))
+            // MAIL FROM
+            sendData("MAIL FROM:<admin@tremtek.com>")
+            dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 Ok") }
+            stateProbe.expectMsg(Transition(handler, Idle, MailFrom))
+            // RCPT TO
+            sendData("RCPT TO:<jcain-NOTFOUND@tremtek.com>")
+            dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("550 User not found") }
+            stateProbe.expectNoMsg(1.second)
+            stop()
           }
         }
         "recipient is normal" should {
@@ -148,6 +173,7 @@ with ImplicitSender {
             sendData("RCPT TO:<jec@tremtek.com>")
             dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 Ok") }
             stateProbe.expectNoMsg(1.second)
+            stop()
           }
         }
       }
@@ -181,6 +207,7 @@ with ImplicitSender {
           stateProbe.expectNoMsg(1.second)
           sendData("This is only a test.")
           stateProbe.expectNoMsg(1.second)
+          stop()
         }
       }
     }
@@ -213,6 +240,7 @@ with ImplicitSender {
           stateProbe.expectNoMsg(1.second)
           sendData("This is only a test.")
           stateProbe.expectNoMsg(1.second)
+          stop()
         }
       }
       "receiving text followed by the terminator" should {
@@ -238,9 +266,11 @@ with ImplicitSender {
           sendData("the emergency broadcast")
           sendData("system.")
           sendData("This is only a test.")
-          sendData("\r\n.")
+          // send remaining terminator in pieces
+          List(46, 13, 10).foreach(b => handler ! Tcp.Received(ByteString(b)))
           dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("250 Ok: queued") }
           stateProbe.expectMsg(Transition(handler, Data, Idle))
+          stop()
         }
       }
     }
