@@ -12,12 +12,17 @@ object Handler {
   val OK = ByteString("250 Ok\r\n")
   val NoRelay = ByteString("554 Relay access denied\r\n")
   val NotFound = ByteString("550 User not found\r\n")
+  val NoPtr = ByteString("550 No PTR record found\r\n")
   val EndWithCrLf = ByteString("354 End data with <CR><LF>.<CR><LF>\r\n")
   val Bye = ByteString("221 Bye\r\n")
 
-  object Patterns {
+  object RcptPatterns {
     val NotFound = "NOTFOUND".r.unanchored
     val NoRelay = "NORELAY".r.unanchored
+  }
+
+  object BodyPatterns {
+    val NoPtr = "_NOPTR_".r.unanchored
   }
 
   // SMTP commands
@@ -151,13 +156,10 @@ extends Actor with FSM[Handler.State, Handler.StateData] with ActorLogging {
   }
 
   when (Data) {
-    case Event(Tcp.Received(data), Pending(remoteHost, from, rcpts, body)) =>
+    case Event(Tcp.Received(data), pending @ Pending(remoteHost, from, rcpts, body)) =>
       val newBody = body.append(data.utf8String)
-      if (newBody.endsWith(Seq(13, 10, 46, 13, 10))) {
-        // TODO: store the message
-        sendData("250 Ok: queued as 12345")
-        goto(Idle) using HeloData(remoteHost)
-      }
+      if (newBody.endsWith(Seq(13, 10, 46, 13, 10)))
+        validateMessage(newBody.toString, pending)
       else
         stay() using Pending(remoteHost, from, rcpts, newBody)
   }
@@ -193,22 +195,31 @@ extends Actor with FSM[Handler.State, Handler.StateData] with ActorLogging {
       stay()
   }
 
-  def validateRecipient(rcpt: String) = {
+  def validateRecipient(rcpt: String) =
     rcpt match {
-      case Patterns.NoRelay(_*) =>
+      case RcptPatterns.NoRelay(_*) =>
         sendData(NoRelay)
         false
-      case Patterns.NotFound(_*) =>
+      case RcptPatterns.NotFound(_*) =>
         sendData(NotFound)
         false
       case _ =>
         sendData(OK)
         true
     }
-  }
 
-  def quit() = {
-    sendData(Bye)
+  def validateMessage(body: String, pending: Pending) =
+    body match {
+      case BodyPatterns.NoPtr(_*) =>
+        quit(NoPtr)
+      case _ =>
+        // TODO: store the message
+        sendData("250 Ok: queued as 12345")
+        goto(Idle) using HeloData(pending.remoteHost)
+    }
+
+  def quit(message: ByteString = Bye) = {
+    sendData(message)
     tcp ! Tcp.Close
     context.stop(self)
     stay()

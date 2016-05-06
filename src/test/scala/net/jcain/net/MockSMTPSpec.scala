@@ -1,13 +1,15 @@
 package net.jcain.net
 
 import akka.actor.FSM.{CurrentState, SubscribeTransitionCallBack, Transition}
-import akka.actor.{ActorSystem, Props}
+import akka.actor.{ActorSystem, Props, Terminated}
 import akka.io.Tcp.Connect
 import akka.io.{IO, Tcp}
 import akka.testkit.{ImplicitSender, TestKit, TestProbe}
 import akka.util.ByteString
 import java.net.InetSocketAddress
+
 import org.scalatest.{BeforeAndAfterAll, Matchers, WordSpecLike}
+
 import scala.concurrent.duration._
 
 class MockSMTPSpec extends TestKit(ActorSystem("MockSMTPSpec"))
@@ -22,7 +24,9 @@ with ImplicitSender {
 
     val dataProbe = TestProbe(s"$label-probe-handler-test")
     val stateProbe = TestProbe(s"$label-probe-handler-state")
+    val lifeProbe = TestProbe(s"$label-probe-handler-life")
     val handler = system.actorOf(Props(classOf[Handler], dataProbe.ref, initialGreeting), s"$label-smtp-handler")
+    lifeProbe.watch(handler)
     handler ! SubscribeTransitionCallBack(stateProbe.ref)
 
     if (initialGreeting.isEmpty) {
@@ -270,6 +274,31 @@ with ImplicitSender {
           List(46, 13, 10).foreach(b => handler ! Tcp.Received(ByteString(b)))
           dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("250 Ok: queued") }
           stateProbe.expectMsg(Transition(handler, Data, Idle))
+          stop()
+        }
+      }
+      "receiving text with _NOPTR_" should {
+        "respond with a 550 and exit" in new HandlerFixture("data-noptr") {
+          // EHLO
+          sendData("EHLO bedevere.tremtek.com")
+          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("250 localhost") }
+          stateProbe.expectMsg(Transition(handler, Greeting, Idle))
+          // MAIL FROM
+          sendData("MAIL FROM:<admin@tremtek.com>")
+          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("250 Ok") }
+          stateProbe.expectMsg(Transition(handler, Idle, MailFrom))
+          // RCPT TO
+          sendData("RCPT TO:<jcain@tremtek.com>")
+          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("250 Ok") }
+          stateProbe.expectMsg(Transition(handler, MailFrom, RcptTo))
+          // DATA
+          sendData("DATA")
+          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("354 End data with") }
+          stateProbe.expectMsg(Transition(handler, RcptTo, Data))
+          // text
+          sendData("This is a test _NOPTR_.\r\n.")
+          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("550 No PTR") }
+          lifeProbe.expectTerminated(handler)
           stop()
         }
       }
