@@ -1,7 +1,7 @@
 package net.jcain.net
 
 import akka.actor.FSM.{CurrentState, SubscribeTransitionCallBack, Transition}
-import akka.actor.{ActorSystem, Props, Terminated}
+import akka.actor.{ActorSystem, Props}
 import akka.io.Tcp.Connect
 import akka.io.{IO, Tcp}
 import akka.testkit.{ImplicitSender, TestKit, TestProbe}
