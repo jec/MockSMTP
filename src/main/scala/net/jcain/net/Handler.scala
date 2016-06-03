@@ -12,7 +12,7 @@ object Handler {
   val OK = ByteString("250 Ok\r\n")
   val NoRelay = ByteString("554 Relay access denied\r\n")
   val NotFound = ByteString("550 User not found\r\n")
-  val NoPtr = ByteString("550 No PTR record found\r\n")
+  val NoPtr = ByteString("550 IP address does not have a PTR\r\n")
   val EndWithCrLf = ByteString("354 End data with <CR><LF>.<CR><LF>\r\n")
   val Bye = ByteString("221 Bye\r\n")
 

@@ -297,7 +297,7 @@ with ImplicitSender {
           stateProbe.expectMsg(Transition(handler, RcptTo, Data))
           // text
           sendData("This is a test _NOPTR_.\r\n.")
-          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith ("550 No PTR") }
+          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should include regex "550.*PTR".r }
           lifeProbe.expectTerminated(handler)
           stop()
         }
