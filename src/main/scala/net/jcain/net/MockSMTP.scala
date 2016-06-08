@@ -7,14 +7,23 @@ import akka.io.Tcp.Bind
 import akka.io.{IO, Tcp}
 
 object MockSMTP {
+  val rgen = new java.security.SecureRandom
+
+  // Protocol: messages received
+  final case class GetRecipients(id: String)
+
   // Protocol: messages sent
   case object Ready
+  final case class Recipients(rcpts: List[String])
+  final case class NotFound(id: String)
 }
 
 class MockSMTP(parent: ActorRef, port: Int, initialGreeting: Option[String] = None) extends Actor with ActorLogging {
 
   import context.system
   import MockSMTP._
+
+  val handlers = collection.mutable.HashMap[String, ActorRef]()
 
   IO(Tcp) ! Bind(self, new InetSocketAddress("localhost", port))
 
@@ -26,7 +35,16 @@ class MockSMTP(parent: ActorRef, port: Int, initialGreeting: Option[String] = No
 
     case Tcp.Connected(remote, local) =>
       log.info(s"Received connection")
-      sender() ! Tcp.Register(context.actorOf(Props(classOf[Handler], sender(), initialGreeting), "handler"))
+      val id = "%016x".format(rgen.nextLong())
+      val handler = context.actorOf(Props(classOf[Handler], id, sender(), initialGreeting), s"handler-$id")
+      sender() ! Tcp.Register(handler)
+      handlers(id) = handler
+
+    case msg @ GetRecipients(id) => handlers.get(id) match {
+      case None => sender() ! NotFound(id)
+      case Some(handler) => handler forward msg
+    }
+
   }
 
 

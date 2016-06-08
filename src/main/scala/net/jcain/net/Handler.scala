@@ -7,7 +7,7 @@ import scala.collection.immutable.Queue
 
 object Handler {
 
-  val InitialGreeting = ByteString("220 localhost ESMTP net.jcain.net.MockSMTP\r\n")
+  val InitialGreeting = "220 localhost ESMTP net.jcain.net.MockSMTP"
   val CommandNotRecognized = ByteString("500 Error: command not recognized\r\n")
   val OK = ByteString("250 Ok\r\n")
   val NoRelay = ByteString("554 Relay access denied\r\n")
@@ -39,6 +39,9 @@ object Handler {
   case object C_RSET extends Command
   case object C_QUIT extends Command
 
+  // Meta-commands
+  case object X_GET_RCPTS extends Command
+
   def createCommand(text: String): Option[Command] = {
     text match {
       case C_HELO.Pattern(_, host) => Some(C_HELO(host))
@@ -48,6 +51,7 @@ object Handler {
       case "DATA" | "data" => Some(C_DATA)
       case "RSET" | "rset" => Some(C_RSET)
       case "QUIT" | "quit" => Some(C_QUIT)
+      case "X_GET_RCPTS" => Some(X_GET_RCPTS)
       case _ => None
     }
   }
@@ -76,7 +80,7 @@ object Handler {
 
 }
 
-class Handler(tcp: ActorRef, initialGreeting: Option[String] = None)
+class Handler(id: String, tcp: ActorRef, initialGreeting: Option[String] = None)
 extends Actor with FSM[Handler.State, Handler.StateData] with ActorLogging {
 
   class BufferedTokenizer(delimiter: String = "\n") {
@@ -111,9 +115,9 @@ extends Actor with FSM[Handler.State, Handler.StateData] with ActorLogging {
 
   initialGreeting match {
     case None =>
-      sendData(InitialGreeting)
+      sendData(s"$InitialGreeting $id")
     case Some(greeting) =>
-      sendData(greeting)
+      sendData(s"$greeting $id")
       tcp ! Tcp.Close
       context.stop(self)
   }
@@ -185,6 +189,14 @@ extends Actor with FSM[Handler.State, Handler.StateData] with ActorLogging {
     case Event(C_RSET, Pending(remoteHost, from, rcpts, body)) =>
       sendData(OK)
       goto(Idle) using HeloData(remoteHost)
+
+    case Event(X_GET_RCPTS, Pending(_, _, rcpts, _)) =>
+      sendData(s"250 ${rcpts.mkString("|")}")
+      stay()
+
+    case Event(MockSMTP.GetRecipients(_), Pending(_, _, rcpts, _)) =>
+      sender() ! MockSMTP.Recipients(rcpts.toList)
+      stay()
 
     case Event(_: Tcp.ConnectionClosed, data: StateData) =>
       log.info("Connection closed in state {}/{}", stateName, data)

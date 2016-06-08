@@ -7,25 +7,54 @@ import akka.io.{IO, Tcp}
 import akka.testkit.{ImplicitSender, TestKit, TestProbe}
 import akka.util.ByteString
 import java.net.InetSocketAddress
-
+import org.scalatest.exceptions.TestFailedException
 import org.scalatest.{BeforeAndAfterAll, Matchers, WordSpecLike}
-
+import scala.collection.mutable.ListBuffer
 import scala.concurrent.duration._
+import scala.language.reflectiveCalls
+import scala.util.matching.Regex
 
 class MockSMTPSpec extends TestKit(ActorSystem("MockSMTPSpec"))
 with WordSpecLike with BeforeAndAfterAll with Matchers
 with ImplicitSender {
 
-  val Port = 9876
+  var port = 9875
+  val rgen = new java.security.SecureRandom
 
   import Handler._
+
+  class ServerFixture(label: String) {
+
+    val tcpProbe = new TestProbe(system) {
+      def expectResponse(regex: Regex): scala.util.matching.Regex.Match = {
+        val input = new ListBuffer[String]
+        while (input.isEmpty || !input.last.endsWith("\r\n"))
+          expectMsgPF() { case Tcp.Received(data) => input.append(data.utf8String) }
+        val response = input.mkString
+        regex.findFirstMatchIn(response) match {
+          case None    => throw new TestFailedException(s"$response did not match Regex $regex", 5)
+          case Some(m) => m
+        }
+      }
+    }
+
+    port += 1
+    val server = system.actorOf(Props(classOf[MockSMTP], tcpProbe.ref, port, None), s"$label-smtp-server")
+
+    // wait for the server to start up and listen
+    tcpProbe.expectMsg(MockSMTP.Ready)
+
+    def stop() = system.stop(server)
+
+  }
 
   class HandlerFixture(label: String, val initialGreeting: Option[String] = None) {
 
     val dataProbe = TestProbe(s"$label-probe-handler-test")
     val stateProbe = TestProbe(s"$label-probe-handler-state")
     val lifeProbe = TestProbe(s"$label-probe-handler-life")
-    val handler = system.actorOf(Props(classOf[Handler], dataProbe.ref, initialGreeting), s"$label-smtp-handler")
+    val handlerId = "%016x".format(rgen.nextLong())
+    val handler = system.actorOf(Props(classOf[Handler], handlerId, dataProbe.ref, initialGreeting), s"$label-smtp-handler-$handlerId")
     lifeProbe.watch(handler)
     handler ! SubscribeTransitionCallBack(stateProbe.ref)
 
@@ -33,7 +62,9 @@ with ImplicitSender {
       // wait for handler to start up
       stateProbe.expectMsg(CurrentState(handler, Greeting))
       // expect initial greeting
-      dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str shouldBe Handler.InitialGreeting }
+      dataProbe.expectMsgPF() {
+        case Tcp.Write(str, _) => str.utf8String shouldBe s"${Handler.InitialGreeting} $handlerId\r\n"
+      }
     }
 
     def sendData(text: String) = handler ! Tcp.Received(ByteString(s"$text\r\n"))
@@ -44,15 +75,42 @@ with ImplicitSender {
 
   "MockSMTP" when {
     "starting up" should {
-      "bind to given port" in {
-        val testProbe = TestProbe("probe-smtp")
-        val server = system.actorOf(Props(classOf[MockSMTP], testProbe.ref, Port, None), "smtp-server")
-        // wait for the server to start up and listen
-        testProbe.expectMsg(MockSMTP.Ready)
+      "bind to given port" in new ServerFixture("svr-start") {
         // attempt to connect to the port
-        IO(Tcp) ! Connect(new InetSocketAddress("localhost", Port))
+        IO(Tcp) ! Connect(new InetSocketAddress("localhost", port))
         expectMsgPF() { case Tcp.Connected(_, _) => }
-        system.stop(server)
+        stop()
+      }
+    }
+    "RcptTo" when {
+      "GetRecipients" should {
+        "reply with the recipients" in new ServerFixture("svr-rcptto-get-rcpts") {
+          // connect to the port
+          IO(Tcp).tell(Connect(new InetSocketAddress("localhost", port)), tcpProbe.ref)
+          tcpProbe.expectMsgPF() { case Tcp.Connected(_, _) => }
+          val tcp = tcpProbe.lastSender
+          tcp.tell(Tcp.Register(tcpProbe.ref), tcpProbe.ref)
+          val matched = tcpProbe.expectResponse("[0-9a-f]{16}$".r)
+          val handlerId = matched.group(0)
+
+          // EHLO
+          tcp.tell(Tcp.Write(ByteString("EHLO bedevere.tremtek.com\r\n")), tcpProbe.ref)
+          tcpProbe.expectResponse("^250 localhost".r)
+          // MAIL FROM
+          tcp.tell(Tcp.Write(ByteString("MAIL FROM:<admin@tremtek.com>\r\n")), tcpProbe.ref)
+          tcpProbe.expectResponse("^250 Ok".r)
+          // RCPT TO
+          tcp.tell(Tcp.Write(ByteString("RCPT TO:<jcain@tremtek.com>\r\n")), tcpProbe.ref)
+          tcpProbe.expectResponse("^250 Ok".r)
+          tcp.tell(Tcp.Write(ByteString("RCPT TO:<chanselman@tremtek.com>\r\n")), tcpProbe.ref)
+          tcpProbe.expectResponse("^250 Ok".r)
+          tcp.tell(Tcp.Write(ByteString("RCPT TO:<jec@tremtek.com>\r\n")), tcpProbe.ref)
+          tcpProbe.expectResponse("^250 Ok".r)
+          // GetRecipients
+          server ! MockSMTP.GetRecipients(handlerId)
+          expectMsg(MockSMTP.Recipients(List("jcain@tremtek.com", "chanselman@tremtek.com", "jec@tremtek.com")))
+          stop()
+        }
       }
     }
   }
@@ -81,7 +139,9 @@ with ImplicitSender {
     "Greeting" when {
       "configured to respond with a busy message" should {
         "respond with the message" in new HandlerFixture("greeting-busy", initialGreeting = Some("554 Service unavailable")) {
-          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String shouldBe initialGreeting.get + "\r\n" }
+          dataProbe.expectMsgPF() {
+            case Tcp.Write(str, _) => str.utf8String shouldBe s"${initialGreeting.get} $handlerId\r\n"
+          }
           stop()
         }
       }
@@ -184,6 +244,32 @@ with ImplicitSender {
     }
 
     "RcptTo" when {
+      "X_GET_RCPTS" should {
+        "reply with the recipients" in new HandlerFixture("rcptto-get-rcpts") {
+          // EHLO
+          sendData("EHLO bedevere.tremtek.com")
+          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 localhost") }
+          stateProbe.expectMsg(Transition(handler, Greeting, Idle))
+          // MAIL FROM
+          sendData("MAIL FROM:<admin@tremtek.com>")
+          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 Ok") }
+          stateProbe.expectMsg(Transition(handler, Idle, MailFrom))
+          // RCPT TO
+          sendData("RCPT TO:<jcain@tremtek.com>")
+          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 Ok") }
+          stateProbe.expectMsg(Transition(handler, MailFrom, RcptTo))
+          sendData("RCPT TO:<chanselman@tremtek.com>")
+          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 Ok") }
+          stateProbe.expectNoMsg(1.second)
+          sendData("RCPT TO:<jec@tremtek.com>")
+          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String should startWith("250 Ok") }
+          stateProbe.expectNoMsg(1.second)
+          // X_GET_RCPTS
+          sendData("X_GET_RCPTS")
+          dataProbe.expectMsgPF() { case Tcp.Write(str, _) => str.utf8String shouldBe "250 jcain@tremtek.com|chanselman@tremtek.com|jec@tremtek.com\r\n" }
+          stop()
+        }
+      }
       "DATA" should {
         "go to Data state and receive text" in new HandlerFixture("rcptto-data") {
           // EHLO
